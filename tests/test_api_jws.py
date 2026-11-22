@@ -283,6 +283,54 @@ class TestJWS:
         decoded = jws.decode(msg, key=jwk)
         assert decoded == payload
 
+    def test_encode_with_jwk_and_matching_algorithm(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        jwk = PyJWK(
+            {
+                "kty": "oct",
+                "alg": "HS256",
+                "k": "c2VjcmV0",  # "secret"
+            }
+        )
+        msg = jws.encode(payload, key=jwk, algorithm="HS256")
+        assert jws.decode(msg, key=jwk) == payload
+
+    def test_encode_with_jwk_and_mismatched_algorithm(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        # The PyJWK is bound to HS256, so explicitly requesting HS512 must
+        # be rejected rather than silently re-declaring the same key
+        # material under a different algorithm.
+        jwk = PyJWK(
+            {
+                "kty": "oct",
+                "alg": "HS256",
+                "k": "c2VjcmV0",  # "secret"
+            }
+        )
+        with pytest.raises(
+            InvalidAlgorithmError, match="does not match the key's algorithm"
+        ):
+            jws.encode(payload, key=jwk, algorithm="HS512")
+
+    def test_encode_with_jwk_and_mismatched_header_alg(
+        self, jws: PyJWS, payload: bytes
+    ) -> None:
+        # A "alg" entry in `headers` overrides the algorithm parameter, so
+        # it must be held to the same binding against the PyJWK's algorithm.
+        jwk = PyJWK(
+            {
+                "kty": "oct",
+                "alg": "HS256",
+                "k": "c2VjcmV0",  # "secret"
+            }
+        )
+        with pytest.raises(
+            InvalidAlgorithmError, match="does not match the key's algorithm"
+        ):
+            jws.encode(payload, key=jwk, headers={"alg": "HS512"})
+
     def test_decode_algorithm_param_should_be_case_sensitive(self, jws: PyJWS) -> None:
         example_jws = (
             "eyJhbGciOiJoczI1NiIsInR5cCI6IkpXVCJ9"  # alg = hs256

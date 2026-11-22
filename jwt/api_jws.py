@@ -196,6 +196,17 @@ class PyJWS:
         # Segments
         signing_input = b".".join(segments)
 
+        if isinstance(key, PyJWK) and algorithm_ != key.algorithm_name:
+            # The PyJWK has a fixed algorithm bound at construction time.
+            # Signing must use that algorithm, not whatever the caller or
+            # the headers advertise, otherwise the same key material can be
+            # re-declared under a different algorithm to sidestep
+            # algorithm-based allow-lists on the verifying side.
+            raise InvalidAlgorithmError(
+                f"Algorithm {algorithm_!r} does not match the key's "
+                f"algorithm {key.algorithm_name!r}"
+            )
+
         alg_obj = self.get_algorithm_by_name(algorithm_)
         if isinstance(key, PyJWK):
             key = key.key
