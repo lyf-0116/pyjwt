@@ -25,7 +25,7 @@ from jwt.exceptions import (
     PyJWKClientError,
     PyJWKSetError,
 )
-from jwt.jwk_set_cache import JWKSetCache
+from jwt.jwk_set_cache import JWKSetCache, RefreshRateLimiter, SigningKeyCache
 
 from .utils import crypto_required
 
@@ -809,3 +809,271 @@ class TestPyJWKClient:
                 jwks_client.get_jwk_set()
 
             assert http_error.closed
+
+
+@contextlib.contextmanager
+def local_jwks_server(
+    payloads: list[object] | None = None,
+) -> Iterator[tuple[str, Any]]:
+    """Serve real HTTP responses from 127.0.0.1 without network stubbing.
+
+    Each GET pops the next payload from *payloads*; the last payload is
+    served repeatedly when the list is exhausted. Returns the base URL and
+    a mutable stats object exposing the request count.
+    """
+    state = {"requests": 0}
+    responses = list(payloads or [RESPONSE_DATA_NO_MATCHING_KID])
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+            state["requests"] += 1
+            payload = responses[min(state["requests"] - 1, len(responses) - 1)]
+            if isinstance(payload, Exception):
+                self.send_error(503, "JWKS unavailable")
+                return
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/jwks.json", state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@contextlib.contextmanager
+def fake_clock(start: float = 1000.0) -> Iterator[list[float]]:
+    """Drive every time-based decision in the client from one fake clock."""
+    clock = [start]
+    # The client injects its clock into the caches/limiter, but cache
+    # classes constructed directly in unit tests read the cache module's
+    # own `time.monotonic`; patch both so one clock drives everything.
+    with (
+        mock.patch("jwt.jwks_client.time.monotonic", side_effect=lambda: clock[0]),
+        mock.patch("jwt.jwk_set_cache.time.monotonic", side_effect=lambda: clock[0]),
+    ):
+        yield clock
+
+
+@crypto_required
+class TestSourceAwareRefreshLimiting:
+    """Cooldown coverage against a real loopback HTTP server.
+
+    These tests deliberately avoid stubbing the network: the client makes
+    genuine HTTP requests to a server on 127.0.0.1, and only the clock is
+    faked.
+    """
+
+    def test_same_unknown_kid_cools_down_without_repeated_requests(self) -> None:
+        with local_jwks_server() as (url, stats):
+            jwks_client = PyJWKClient(url, cooldown_duration=30)
+            with fake_clock() as clock:
+                jwks_client.get_jwk_set()
+                assert stats["requests"] == 1
+                clock[0] += 31
+
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    jwks_client.get_signing_key("forged-kid")
+                assert stats["requests"] == 2
+
+                for _ in range(3):
+                    with pytest.raises(PyJWKClientError, match="matches"):
+                        jwks_client.get_signing_key("forged-kid")
+                assert stats["requests"] == 2
+
+                clock[0] += 30
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    jwks_client.get_signing_key("forged-kid")
+                assert stats["requests"] == 3
+
+    def test_distinct_forged_kids_share_the_global_floor(self) -> None:
+        with local_jwks_server() as (url, stats):
+            jwks_client = PyJWKClient(url, cooldown_duration=30)
+            with fake_clock() as clock:
+                jwks_client.get_jwk_set()
+                clock[0] += 31
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    jwks_client.get_signing_key("forged-kid-1")
+                assert stats["requests"] == 2
+
+                # A different key ID must not open a second cooldown window:
+                # the global floor still applies even though the per-kid
+                # tracker has never seen this ID.
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    jwks_client.get_signing_key("forged-kid-2")
+                assert stats["requests"] == 2
+
+                clock[0] += 30
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    jwks_client.get_signing_key("forged-kid-2")
+                assert stats["requests"] == 3
+
+    def test_rotated_kid_is_fetched_when_the_window_elapses(self) -> None:
+        with local_jwks_server(
+            [RESPONSE_DATA_NO_MATCHING_KID, RESPONSE_DATA_WITH_MATCHING_KID]
+        ) as (url, stats):
+            jwks_client = PyJWKClient(url, cooldown_duration=30)
+            rotated_kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+            with fake_clock() as clock:
+                jwks_client.get_jwk_set()
+                assert stats["requests"] == 1
+                # The initial key set does not know the rotated ID.
+                clock[0] += 31
+                signing_key = jwks_client.get_signing_key(rotated_kid)
+                assert stats["requests"] == 2
+                assert signing_key.key_id == rotated_kid
+
+                clock[0] += 30
+                # The rotated key now resolves from the cache without
+                # touching the network again.
+                assert jwks_client.get_signing_key(rotated_kid) is signing_key
+                assert stats["requests"] == 2
+
+    def test_failed_refresh_backs_off_per_kid_with_jitter(self) -> None:
+        with local_jwks_server(
+            [RESPONSE_DATA_NO_MATCHING_KID, RuntimeError("boom")]
+        ) as (url, stats):
+            jwks_client = PyJWKClient(url, cooldown_duration=30)
+            assert jwks_client._refresh_limiter is not None
+            jwks_client._refresh_limiter._jitter = lambda value: 0.0
+            kid = "forged-kid"
+            with fake_clock() as clock:
+                jwks_client.get_jwk_set()
+                clock[0] += 31
+                with pytest.raises(PyJWKClientConnectionError):
+                    jwks_client.get_signing_key(kid)
+                assert stats["requests"] == 2
+
+                # Inside the doubled backoff window the failed kid is not
+                # retried, even past the ordinary cooldown window.
+                clock[0] += 29
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    jwks_client.get_signing_key(kid)
+                assert stats["requests"] == 2
+
+                clock[0] += 2
+                with pytest.raises(PyJWKClientConnectionError):
+                    jwks_client.get_signing_key(kid)
+                assert stats["requests"] == 3
+
+    def test_limiter_per_kid_backoff_doubles_and_resets_on_success(self) -> None:
+        limiter = RefreshRateLimiter(
+            cooldown_duration=10, max_tracked_kids=4, jitter=lambda value: 0.0
+        )
+        assert limiter.is_allowed("kid", global_floor=-100.0, now=0.0)
+        limiter.record_attempt("kid", now=0.0)
+        limiter.record_failure("kid")
+
+        assert not limiter.is_allowed("kid", global_floor=-100.0, now=9.0)
+        assert limiter.is_allowed("kid", global_floor=-100.0, now=10.0)
+
+        limiter.record_attempt("kid", now=10.0)
+        limiter.record_failure("kid")
+        # Second failure doubles the backoff to 20s.
+        assert not limiter.is_allowed("kid", global_floor=-100.0, now=25.0)
+        assert limiter.is_allowed("kid", global_floor=-100.0, now=30.0)
+
+        # A different kid is independent of the first one's failures.
+        assert limiter.is_allowed("other", global_floor=-100.0, now=30.0)
+
+        limiter.record_attempt("kid", now=30.0)
+        limiter.record_success("kid")
+        assert limiter.is_allowed("kid", global_floor=-100.0, now=31.0)
+
+    def test_limiter_global_floor_blocks_bursts_of_distinct_kids(self) -> None:
+        limiter = RefreshRateLimiter(
+            cooldown_duration=30, max_tracked_kids=16, jitter=lambda value: 0.0
+        )
+        limiter.record_attempt("kid-0", now=100.0)
+        for index in range(5):
+            assert not limiter.is_allowed(f"kid-{index}", global_floor=100.0, now=100.0)
+
+
+@crypto_required
+class TestAlignedCacheSemantics:
+    def test_signing_key_cache_entries_expire_with_the_lifespan(self) -> None:
+        key = mock.Mock(spec=PyJWK)
+        with fake_clock() as clock:
+            cache = SigningKeyCache(maxsize=4, lifespan=30)
+            cache.put("kid", key)
+            assert cache.get("kid") is key
+            clock[0] += 29
+            assert cache.get("kid") is key
+            clock[0] += 2
+            assert cache.get("kid") is None
+
+    def test_signing_key_cache_lru_eviction_is_bounded(self) -> None:
+        first = mock.Mock(spec=PyJWK)
+        second = mock.Mock(spec=PyJWK)
+        third = mock.Mock(spec=PyJWK)
+        with fake_clock():
+            cache = SigningKeyCache(maxsize=2, lifespan=300)
+            cache.put("kid-1", first)
+            cache.put("kid-2", second)
+            cache.get("kid-1")  # make kid-2 the LRU entry
+            cache.put("kid-3", third)
+
+            assert cache.get("kid-2") is None
+            assert cache.get("kid-1") is first
+            assert cache.get("kid-3") is third
+
+    def test_evicted_then_expired_key_revalidates_over_real_http(self) -> None:
+        with local_jwks_server(
+            [RESPONSE_DATA_WITH_MATCHING_KID, RESPONSE_DATA_WITH_MATCHING_KID]
+        ) as (url, stats):
+            kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+            jwks_client = PyJWKClient(
+                url, cache_keys=True, max_cached_keys=1, lifespan=300
+            )
+            with fake_clock() as clock:
+                jwks_client.get_signing_key(kid)
+                initial_requests = stats["requests"]
+                assert initial_requests == 1
+
+                # Expire both tiers via the fake clock rather than LRU
+                # pressure: a revalidation must reach the server once and
+                # re-populate both caches with aligned TTL semantics.
+                clock[0] += 301
+                jwks_client.get_signing_key(kid)
+                assert stats["requests"] == initial_requests + 1
+
+                clock[0] += 1
+                jwks_client.get_signing_key(kid)
+                assert stats["requests"] == initial_requests + 1
+
+    def test_lru_eviction_does_not_trigger_extra_refresh(self) -> None:
+        two_keys = copy.deepcopy(RESPONSE_DATA_WITH_MATCHING_KID)
+        second_key = copy.deepcopy(two_keys["keys"][0])
+        second_key["kid"] = "SECOND-KEY-KID"
+        two_keys["keys"].append(second_key)
+
+        with local_jwks_server([two_keys]) as (url, stats):
+            jwks_client = PyJWKClient(
+                url, cache_keys=True, max_cached_keys=1, lifespan=300
+            )
+            first_kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+            with fake_clock():
+                jwks_client.get_signing_key(first_kid)
+                assert stats["requests"] == 1
+
+                # Looking up the second kid evicts the first from the
+                # per-key LRU, but both remain in the JWK Set cache.
+                jwks_client.get_signing_key("SECOND-KEY-KID")
+                assert stats["requests"] == 1
+
+                # The evicted kid must be re-resolved from the cached key
+                # set, not via another outbound request.
+                re_resolved = jwks_client.get_signing_key(first_kid)
+                assert re_resolved.key_id == first_kid
+                assert stats["requests"] == 1

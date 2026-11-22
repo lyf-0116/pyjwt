@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from .algorithms import get_default_algorithms, has_crypto, requires_cryptography
@@ -185,9 +185,13 @@ class PyJWKSet:
 
 
 class PyJWTSetWithTimestamp:
-    def __init__(self, jwk_set: PyJWKSet):
+    def __init__(
+        self,
+        jwk_set: PyJWKSet,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.jwk_set = jwk_set
-        self.timestamp = time.monotonic()
+        self.timestamp = clock()
 
     def get_jwk_set(self) -> PyJWKSet:
         return self.jwk_set

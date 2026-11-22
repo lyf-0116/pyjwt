@@ -512,7 +512,18 @@ verification; do not infer that relationship from those JWK members alone.
 
 If the ``kid`` is not found in the current key set, ``PyJWKClient``
 automatically refreshes the JWKS from the endpoint and retries before raising
-an error.
+an error. These forced refreshes are rate limited per key ID (so repeated
+lookups of the same unknown ``kid`` do not cause repeated requests) and by a
+global floor of one refresh per ``cooldown_duration`` window across the whole
+client (so a flood of distinct forged key IDs cannot fan out into a flood of
+outbound requests). Failed refreshes back off exponentially with jitter; set
+``cooldown_duration`` to ``0`` to disable limiting.
+
+When ``cache_keys`` is enabled, individual signing keys are cached in a
+bounded LRU cache whose entries expire after the same ``lifespan`` as the
+cached JWK Set. A cached key therefore cannot outlive the key set it came
+from, and LRU eviction no longer turns a previously cached ID into a network
+request on its next lookup.
 
 ``PyJWKClient`` also includes built-in caching to avoid unnecessary network
 requests. See :class:`~jwt.PyJWKClient` in the API reference for details on
