@@ -139,8 +139,23 @@ _SSH_KEY_FORMATS = (
     b"ecdsa-sha2-nistp256",
     b"ecdsa-sha2-nistp384",
     b"ecdsa-sha2-nistp521",
+    b"sk-ssh-ed25519",
+    b"sk-ecdsa-sha2-nistp256",
+)
+
+# An SSH public key line has the shape:
+#   [authorized_keys options/markers] <key-type> <base64 blob> [comment]
+# where the key type may carry a "-cert-v01@openssh.com" or "@openssh.com"
+# suffix. Anchor the key type at a word boundary so that key material
+# preceded by leading whitespace, authorized_keys options, or markers is
+# still recognized, and require the base64 blob so that arbitrary secrets
+# merely mentioning a key type (e.g. a passphrase) are not misclassified.
+_SSH_KEY_RE = re.compile(
+    b"(?:^|\\s)(?:"
+    + b"|".join(_SSH_KEY_FORMATS)
+    + b")[-\\w.@]*[ \\t]+[A-Za-z0-9+/]{16,}={0,2}(?:\\s|$)"
 )
 
 
 def is_ssh_key(key: bytes) -> bool:
-    return key.startswith(_SSH_KEY_FORMATS)
+    return _SSH_KEY_RE.search(key) is not None

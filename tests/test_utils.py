@@ -55,8 +55,33 @@ def test_force_bytes_raises_error_on_invalid_object() -> None:
         b"ecdsa-sha2-nistp256",
         b"ecdsa-sha2-nistp384",
         b"ecdsa-sha2-nistp521",
+        b"sk-ssh-ed25519@openssh.com",
+        b"sk-ecdsa-sha2-nistp256@openssh.com",
+        b"ssh-rsa-cert-v01@openssh.com",
+        b"ssh-ed25519-cert-v01@openssh.com",
+        b"sk-ssh-ed25519-cert-v01@openssh.com",
     ),
 )
 def test_is_ssh_key(key_format: bytes) -> None:
-    assert is_ssh_key(key_format + b" any") is True
+    blob = b"A" * 70
+    assert is_ssh_key(key_format + b" " + blob) is True
+    assert is_ssh_key(key_format + b" " + blob + b" a comment") is True
+    assert is_ssh_key(b"\n " + key_format + b" " + blob) is True
+    assert is_ssh_key(b"no-port-forwarding " + key_format + b" " + blob) is True
+    assert is_ssh_key(b"@cert-authority " + key_format + b" " + blob) is True
+    assert is_ssh_key(b"# a comment\n" + key_format + b" " + blob) is True
     assert is_ssh_key(b"not a ssh key") is False
+
+
+@pytest.mark.parametrize(
+    "secret",
+    (
+        b"not a ssh key",
+        b"ssh-rsa",
+        b"ssh-rsa not-a-key",
+        b"my ssh-rsa passphrase is strong",
+        b"use ssh-ed25519 or ecdsa-sha2-nistp256 for auth",
+    ),
+)
+def test_is_ssh_key_accepts_non_key_secrets(secret: bytes) -> None:
+    assert is_ssh_key(secret) is False

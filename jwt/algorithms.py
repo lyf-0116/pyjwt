@@ -73,6 +73,7 @@ try:
         NoEncryption,
         PrivateFormat,
         PublicFormat,
+        load_der_private_key,
         load_der_public_key,
         load_pem_private_key,
         load_pem_public_key,
@@ -332,6 +333,18 @@ class HMACAlgorithm(Algorithm):
         try:
             load_der_public_key(key_bytes)
         except (TypeError, ValueError, UnsupportedAlgorithm):
+            pass
+        else:
+            return True
+
+        try:
+            load_der_private_key(key_bytes, password=None)
+        except TypeError:
+            # A TypeError here means the data deserialized as an encrypted
+            # private key (no password was given), which is still
+            # structured key material.
+            return True
+        except (ValueError, UnsupportedAlgorithm):
             pass
         else:
             return True

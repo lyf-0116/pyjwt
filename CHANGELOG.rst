@@ -7,6 +7,16 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 `Unreleased <https://github.com/jpadilla/pyjwt/compare/2.15.1...HEAD>`__
 -------------------------------------------------------------------------
 
+Security
+~~~~~~~~
+
+- Harden the HMAC key confusion defense: ``HMACAlgorithm.prepare_key`` now
+  also rejects DER-encoded private keys (including encrypted ones) and
+  recognizes SSH public key material preceded by whitespace, authorized_keys
+  options/markers, or using ``sk-*``/``-cert`` key types, closing
+  algorithm-confusion bypasses where structured asymmetric key material
+  could be used as an HMAC secret.
+
 Changed
 ~~~~~~~
 

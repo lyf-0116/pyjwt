@@ -30,8 +30,12 @@ if has_crypto:
         RSAPublicKey,
     )
     from cryptography.hazmat.primitives.serialization import (
+        BestAvailableEncryption,
         Encoding,
+        NoEncryption,
+        PrivateFormat,
         PublicFormat,
+        load_pem_private_key,
     )
 
     from jwt.algorithms import ECAlgorithm, OKPAlgorithm, RSAAlgorithm, RSAPSSAlgorithm
@@ -354,6 +358,72 @@ class TestAlgorithms:
 
         with pytest.raises(InvalidKeyError, match="x509 certificate"):
             algo.prepare_key(der_certificate)
+
+    @crypto_required
+    @pytest.mark.parametrize(
+        "key_format_name",
+        ("PKCS8", "TraditionalOpenSSL"),
+    )
+    def test_hmac_prepare_key_rejects_der_private_key(
+        self, key_format_name: str
+    ) -> None:
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        with open(key_path("testkey_rsa.priv"), "rb") as pem_key:
+            private_key = cast(
+                RSAPrivateKey, load_pem_private_key(pem_key.read(), password=None)
+            )
+        der_key = private_key.private_bytes(
+            Encoding.DER, getattr(PrivateFormat, key_format_name), NoEncryption()
+        )
+
+        with pytest.raises(InvalidKeyError, match="asymmetric key"):
+            algo.prepare_key(der_key)
+
+    @crypto_required
+    def test_hmac_prepare_key_rejects_encrypted_der_private_key(self) -> None:
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        with open(key_path("testkey_rsa.priv"), "rb") as pem_key:
+            private_key = cast(
+                RSAPrivateKey, load_pem_private_key(pem_key.read(), password=None)
+            )
+        der_key = private_key.private_bytes(
+            Encoding.DER,
+            PrivateFormat.PKCS8,
+            BestAvailableEncryption(b"password"),
+        )
+
+        with pytest.raises(InvalidKeyError, match="asymmetric key"):
+            algo.prepare_key(der_key)
+
+    @pytest.mark.parametrize(
+        "key_line",
+        (
+            b"ssh-rsa {blob} comment",
+            b"\nssh-rsa {blob}",
+            b"  ssh-ed25519 {blob}",
+            b"no-port-forwarding ssh-rsa {blob}",
+            b'command="echo" ecdsa-sha2-nistp256 {blob}',
+            b"@cert-authority ssh-rsa {blob}",
+            b"ssh-rsa-cert-v01@openssh.com {blob}",
+            b"sk-ssh-ed25519@openssh.com {blob}",
+            b"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com {blob}",
+            b"# a comment\nssh-dss {blob}",
+        ),
+    )
+    def test_hmac_prepare_key_rejects_ssh_public_key_shapes(
+        self, key_line: bytes
+    ) -> None:
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        key = key_line.replace(b"{blob}", b"A" * 70)
+
+        with pytest.raises(InvalidKeyError, match="asymmetric key"):
+            algo.prepare_key(key)
+
+    def test_hmac_prepare_key_accepts_secret_mentioning_ssh_key_type(self) -> None:
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        secret = b"my ssh-rsa passphrase is not a key"
+
+        assert algo.prepare_key(secret) == secret
 
     @crypto_required
     def test_hmac_prepare_key_accepts_non_key_binary_secret(self) -> None:
